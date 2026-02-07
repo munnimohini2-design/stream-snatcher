@@ -11,6 +11,11 @@ export default defineConfig(({ mode }) => ({
     hmr: {
       overlay: false,
     },
+    proxy: {
+      '/analyze': 'http://localhost:3001',
+      '/proxy': 'http://localhost:3001',
+      '/download-url': 'http://localhost:3001',
+    },
   },
   plugins: [react(), mode === "development" && componentTagger()].filter(Boolean),
   resolve: {
