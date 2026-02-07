@@ -1,7 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 
 interface DownloadProgress {
-  phase: 'idle' | 'loading' | 'playing' | 'recording' | 'finalizing' | 'complete' | 'error';
+  phase: 'idle' | 'loading' | 'playing' | 'recording' | 'finalizing' | 'complete' | 'error' | 'sessionProtected';
   percentage: number;
   duration: number;
   currentTime: number;
@@ -213,13 +213,25 @@ export function useClientDownloader(): UseClientDownloaderResult {
           
         case 'error':
           console.error('[parent] Iframe error:', data.message);
-          setProgress(prev => ({
-            ...prev,
-            phase: 'error',
-            error: data.message || 'Playback failed',
-          }));
-          if (data.fatal) {
+          // Detect session-protected streams
+          if (data.sessionProtected) {
+            setProgress({
+              phase: 'sessionProtected',
+              percentage: 0,
+              duration: 0,
+              currentTime: 0,
+              error: 'This stream requires an authenticated session from the original website and cannot be downloaded directly. Open the video page and use browser developer tools instead.',
+            });
             cleanup();
+          } else {
+            setProgress(prev => ({
+              ...prev,
+              phase: 'error',
+              error: data.message || 'Playback failed',
+            }));
+            if (data.fatal) {
+              cleanup();
+            }
           }
           break;
           
@@ -254,7 +266,7 @@ export function useClientDownloader(): UseClientDownloaderResult {
   
   return {
     progress,
-    isDownloading: progress.phase !== 'idle' && progress.phase !== 'complete' && progress.phase !== 'error',
+    isDownloading: progress.phase !== 'idle' && progress.phase !== 'complete' && progress.phase !== 'error' && progress.phase !== 'sessionProtected',
     startDownload,
     cancelDownload,
   };

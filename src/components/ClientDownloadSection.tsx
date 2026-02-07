@@ -3,7 +3,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Download, AlertCircle, XCircle, CheckCircle2, Monitor } from 'lucide-react';
+import { Download, AlertCircle, XCircle, CheckCircle2, Monitor, ShieldAlert } from 'lucide-react';
 import { useClientDownloader } from '@/hooks/useClientDownloader';
 import type { StreamQuality } from '@/types/stream';
 
@@ -41,6 +41,8 @@ export function ClientDownloadSection({ streamUrl, qualities }: ClientDownloadSe
         return 'Download complete!';
       case 'error':
         return progress.error || 'Download failed';
+      case 'sessionProtected':
+        return progress.error || 'Session-protected stream';
       default:
         return 'Ready to download';
     }
@@ -90,66 +92,81 @@ export function ClientDownloadSection({ streamUrl, qualities }: ClientDownloadSe
           </div>
         )}
 
-        {/* Quality selector and action buttons */}
-        <div className="flex gap-3">
-          {qualities.length > 1 && !isDownloading && (
-            <Select 
-              value={selectedQuality} 
-              onValueChange={setSelectedQuality}
-              disabled={progress.phase === 'complete'}
-            >
-              <SelectTrigger className="flex-1">
-                <SelectValue placeholder="Select quality" />
-              </SelectTrigger>
-              <SelectContent>
-                {qualities.map((q, i) => (
-                  <SelectItem key={i} value={q.url}>
-                    {q.resolution || `Quality ${i + 1}`}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          )}
-          
-          {isDownloading ? (
-            <Button 
-              variant="destructive" 
-              onClick={cancelDownload}
-              className="min-w-[160px]"
-            >
-              <XCircle className="h-4 w-4" />
-              Cancel
-            </Button>
-          ) : (
-            <Button 
-              onClick={handleDownload}
-              disabled={progress.phase === 'complete'}
-              className="min-w-[160px]"
-            >
-              {progress.phase === 'complete' ? (
-                <>
-                  <CheckCircle2 className="h-4 w-4" />
-                  Downloaded
-                </>
-              ) : (
-                <>
-                  <Download className="h-4 w-4" />
-                  Download WebM
-                </>
-              )}
-            </Button>
-          )}
-        </div>
+        {/* Session-protected status */}
+        {progress.phase === 'sessionProtected' && (
+          <div className="flex items-start gap-2 p-3 rounded-lg bg-purple-500/10 border border-purple-500/20">
+            <ShieldAlert className="h-4 w-4 text-purple-400 mt-0.5 shrink-0" />
+            <div className="text-sm text-purple-300">
+              <p className="font-medium mb-1">Session-Protected Stream</p>
+              <p className="text-purple-300/80">{getPhaseText()}</p>
+            </div>
+          </div>
+        )}
 
-        {selectedQualityInfo && selectedQualityInfo.resolution && (
+        {/* Quality selector and action buttons */}
+        {progress.phase !== 'sessionProtected' && (
+          <div className="flex gap-3">
+            {qualities.length > 1 && !isDownloading && (
+              <Select 
+                value={selectedQuality} 
+                onValueChange={setSelectedQuality}
+                disabled={progress.phase === 'complete'}
+              >
+                <SelectTrigger className="flex-1">
+                  <SelectValue placeholder="Select quality" />
+                </SelectTrigger>
+                <SelectContent>
+                  {qualities.map((q, i) => (
+                    <SelectItem key={i} value={q.url}>
+                      {q.resolution || `Quality ${i + 1}`}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
+          
+            {isDownloading ? (
+              <Button 
+                variant="destructive" 
+                onClick={cancelDownload}
+                className="min-w-[160px]"
+              >
+                <XCircle className="h-4 w-4" />
+                Cancel
+              </Button>
+            ) : (
+              <Button 
+                onClick={handleDownload}
+                disabled={progress.phase === 'complete'}
+                className="min-w-[160px]"
+              >
+                {progress.phase === 'complete' ? (
+                  <>
+                    <CheckCircle2 className="h-4 w-4" />
+                    Downloaded
+                  </>
+                ) : (
+                  <>
+                    <Download className="h-4 w-4" />
+                    Download WebM
+                  </>
+                )}
+              </Button>
+            )}
+          </div>
+        )}
+
+        {selectedQualityInfo && selectedQualityInfo.resolution && progress.phase !== 'sessionProtected' && (
           <p className="text-xs text-muted-foreground">
             Selected: {selectedQualityInfo.resolution}
           </p>
         )}
 
-        <p className="text-xs text-muted-foreground">
-          Browser-based download uses MediaRecorder. The video will play at normal speed while recording.
-        </p>
+        {progress.phase !== 'sessionProtected' && (
+          <p className="text-xs text-muted-foreground">
+            Browser-based download uses MediaRecorder. The video will play at normal speed while recording.
+          </p>
+        )}
       </CardContent>
     </Card>
   );

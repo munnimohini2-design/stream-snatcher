@@ -141,9 +141,15 @@
         hls.on(Hls.Events.ERROR, (event, data) => {
           console.error('[iframe] HLS error:', data);
           if (data.fatal) {
+            // Detect session-protected streams (403/401 or network errors on segments)
+            const isAuthError = data.response?.code === 403 || data.response?.code === 401;
+            const isNetworkError = data.type === Hls.ErrorTypes.NETWORK_ERROR;
+            const isSessionProtected = isAuthError || (isNetworkError && data.details === 'fragLoadError');
+            
             sendToParent('error', { 
               message: 'Stream load failed: ' + (data.reason || data.details || 'Unknown error'),
-              fatal: true 
+              fatal: true,
+              sessionProtected: isSessionProtected
             });
           }
         });
