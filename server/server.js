@@ -3,6 +3,13 @@
  * 
  * A minimal, stateless Node.js server using only native modules.
  * Handles stream analysis, proxying, and download URL generation.
+ * 
+ * Reliability features:
+ * - Range request support for seeking
+ * - No Content-Length forwarding (prevents chunked encoding issues)
+ * - Proper encryption detection via METHOD parsing
+ * - Client disconnect handling to prevent memory leaks
+ * - Proper URL encoding for worker download URLs
  */
 
 const http = require('http');
@@ -51,6 +58,7 @@ function resolveUrl(baseUrl, relativePath) {
 
 /**
  * Fetch URL with timeout and optional header forwarding
+ * Returns { req, res } so caller can handle cleanup
  */
 function fetchWithTimeout(urlString, headers = {}, timeout = REQUEST_TIMEOUT) {
   return new Promise((resolve, reject) => {
@@ -78,7 +86,8 @@ function fetchWithTimeout(urlString, headers = {}, timeout = REQUEST_TIMEOUT) {
         return;
       }
       
-      resolve(res);
+      // Return both request and response for cleanup handling
+      resolve({ req, res });
     });
 
     req.on('error', reject);
@@ -105,6 +114,31 @@ function readBody(res) {
 }
 
 /**
+ * Detect encryption from M3U8 content using proper METHOD parsing
+ * Returns true if encrypted (METHOD is not NONE or missing)
+ */
+function detectEncryption(content) {
+  const keyTagRegex = /#EXT-X-KEY:([^\n]+)/g;
+  let match;
+  
+  while ((match = keyTagRegex.exec(content)) !== null) {
+    const attributes = match[1];
+    
+    // Parse METHOD attribute
+    const methodMatch = attributes.match(/METHOD=([^,\s]+)/);
+    if (methodMatch) {
+      const method = methodMatch[1].toUpperCase();
+      // If METHOD is anything other than NONE, it's encrypted
+      if (method !== 'NONE') {
+        return true;
+      }
+    }
+  }
+  
+  return false;
+}
+
+/**
  * Parse M3U8 playlist content
  */
 function parseM3u8(content, baseUrl) {
@@ -118,10 +152,8 @@ function parseM3u8(content, baseUrl) {
     qualities: [],
   };
   
-  // Check for encryption
-  if (content.includes('#EXT-X-KEY') && !content.includes('METHOD=NONE')) {
-    result.isEncrypted = true;
-  }
+  // Check for encryption using proper METHOD parsing
+  result.isEncrypted = detectEncryption(content);
   
   // Check for VOD (has end marker)
   if (content.includes('#EXT-X-ENDLIST')) {
@@ -203,7 +235,7 @@ function sendJson(res, statusCode, data) {
     'Content-Type': 'application/json',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Headers': 'Content-Type, Range',
   });
   res.end(JSON.stringify(data));
 }
@@ -244,7 +276,7 @@ async function handleAnalyze(req, res, url) {
     if (req.headers['referer']) headers['Referer'] = req.headers['referer'];
     if (req.headers['origin']) headers['Origin'] = req.headers['origin'];
     
-    const response = await fetchWithTimeout(m3u8Url, headers);
+    const { res: response } = await fetchWithTimeout(m3u8Url, headers);
     
     if (response.statusCode !== 200) {
       return sendError(res, 502, 'Fetch failed', `Unable to fetch stream (HTTP ${response.statusCode})`);
@@ -268,7 +300,7 @@ async function handleAnalyze(req, res, url) {
 }
 
 /**
- * Handle /proxy endpoint
+ * Handle /proxy endpoint with Range support and memory leak prevention
  */
 async function handleProxy(req, res, url) {
   const resourceUrl = url.searchParams.get('url');
@@ -277,14 +309,25 @@ async function handleProxy(req, res, url) {
     return sendError(res, 400, 'Missing URL', 'Please provide a resource URL');
   }
   
+  let upstreamReq = null;
+  
   try {
-    // Forward relevant headers
+    // Forward relevant headers including Range for seeking support
     const headers = {};
     if (req.headers['user-agent']) headers['User-Agent'] = req.headers['user-agent'];
     if (req.headers['referer']) headers['Referer'] = req.headers['referer'];
     if (req.headers['origin']) headers['Origin'] = req.headers['origin'];
+    if (req.headers['range']) headers['Range'] = req.headers['range'];
     
-    const response = await fetchWithTimeout(resourceUrl, headers);
+    const { req: upstream, res: response } = await fetchWithTimeout(resourceUrl, headers);
+    upstreamReq = upstream;
+    
+    // Prevent memory leak: abort upstream if client disconnects
+    res.on('close', () => {
+      if (upstreamReq) {
+        upstreamReq.destroy();
+      }
+    });
     
     // Determine content type
     let contentType = response.headers['content-type'] || 'application/octet-stream';
@@ -297,48 +340,70 @@ async function handleProxy(req, res, url) {
       // Rewrite relative URLs in the playlist
       const rewritten = content.split('\n').map(line => {
         const trimmed = line.trim();
-        // Skip empty lines and comments (except URI references in comments)
-        if (!trimmed || (trimmed.startsWith('#') && !trimmed.includes('URI='))) {
-          // Handle URI= in tags like #EXT-X-KEY
-          if (trimmed.includes('URI="')) {
-            return trimmed.replace(/URI="([^"]+)"/g, (match, uri) => {
-              const resolved = resolveUrl(baseUrl, uri);
-              return resolved ? `URI="${resolved}"` : match;
-            });
-          }
+        // Handle URI= in tags like #EXT-X-KEY
+        if (trimmed.includes('URI="')) {
+          return trimmed.replace(/URI="([^"]+)"/g, (match, uri) => {
+            const resolved = resolveUrl(baseUrl, uri);
+            return resolved ? `URI="${resolved}"` : match;
+          });
+        }
+        // Skip empty lines and other comments
+        if (!trimmed || trimmed.startsWith('#')) {
           return line;
         }
         // Resolve non-comment lines (segment URLs)
-        if (!trimmed.startsWith('#')) {
-          const resolved = resolveUrl(baseUrl, trimmed);
-          return resolved || line;
-        }
-        return line;
+        const resolved = resolveUrl(baseUrl, trimmed);
+        return resolved || line;
       }).join('\n');
       
       res.writeHead(200, {
         'Content-Type': 'application/vnd.apple.mpegurl',
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type',
+        'Access-Control-Allow-Headers': 'Content-Type, Range',
+        'Access-Control-Expose-Headers': 'Content-Range, Accept-Ranges',
         'Cache-Control': 'no-cache',
       });
       res.end(rewritten);
       return;
     }
     
-    // For segments, stream directly
-    res.writeHead(response.statusCode, {
+    // For segments (.ts, .m4s, etc.), stream directly
+    // DO NOT forward Content-Length - some CDNs use chunked encoding
+    // which causes playback freezing when length is forwarded
+    const responseHeaders = {
       'Content-Type': contentType,
-      'Content-Length': response.headers['content-length'],
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-    });
+      'Access-Control-Allow-Headers': 'Content-Type, Range',
+      'Access-Control-Expose-Headers': 'Content-Range, Accept-Ranges',
+      'Cache-Control': 'no-cache',
+    };
     
+    // Forward range-related headers for seeking support
+    if (response.headers['content-range']) {
+      responseHeaders['Content-Range'] = response.headers['content-range'];
+    }
+    if (response.headers['accept-ranges']) {
+      responseHeaders['Accept-Ranges'] = response.headers['accept-ranges'];
+    }
+    
+    // Use 206 for partial content, 200 otherwise
+    const statusCode = response.statusCode === 206 ? 206 : 200;
+    
+    res.writeHead(statusCode, responseHeaders);
+    
+    // Pipe with error handling
     response.pipe(res);
     
+    response.on('error', () => {
+      res.end();
+    });
+    
   } catch (err) {
+    if (upstreamReq) {
+      upstreamReq.destroy();
+    }
     if (err.message === 'Request timeout') {
       return sendError(res, 504, 'Request timeout', 'Resource took too long to respond');
     }
@@ -347,7 +412,7 @@ async function handleProxy(req, res, url) {
 }
 
 /**
- * Handle /download-url endpoint
+ * Handle /download-url endpoint with proper URL encoding
  */
 function handleDownloadUrl(req, res, url) {
   const m3u8Url = url.searchParams.get('url');
@@ -369,13 +434,13 @@ function handleDownloadUrl(req, res, url) {
     return sendError(res, 403, 'Blocked domain', 'This source is not supported');
   }
   
-  // Construct worker download URL
-  const params = new URLSearchParams({ url: m3u8Url });
-  if (quality) {
-    params.append('quality', quality);
-  }
+  // Construct worker download URL with proper encoding
+  // Use encodeURIComponent to handle URLs with query strings/tokens
+  let downloadUrl = `${WORKER_BASE_URL}/download?url=${encodeURIComponent(m3u8Url)}`;
   
-  const downloadUrl = `${WORKER_BASE_URL}/download?${params.toString()}`;
+  if (quality) {
+    downloadUrl += `&quality=${encodeURIComponent(quality)}`;
+  }
   
   sendJson(res, 200, { downloadUrl });
 }
@@ -384,12 +449,13 @@ function handleDownloadUrl(req, res, url) {
  * Main request handler
  */
 function handleRequest(req, res) {
-  // Handle CORS preflight
+  // Handle CORS preflight - include Range header support
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Headers': 'Content-Type, Range',
+      'Access-Control-Expose-Headers': 'Content-Range, Accept-Ranges',
     });
     res.end();
     return;
