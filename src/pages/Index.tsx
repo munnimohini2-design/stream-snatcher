@@ -6,10 +6,23 @@ import { DownloadSection } from '@/components/DownloadSection';
 import { ClientDownloadSection } from '@/components/ClientDownloadSection';
 import { Disclaimer } from '@/components/Disclaimer';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
-import { AlertCircle, Download, Loader2 } from 'lucide-react';
+import { AlertCircle, Download, ShieldAlert } from 'lucide-react';
 import { analyzeStream } from '@/services/api';
 import { fetchAndParsePlaylist } from '@/utils/clientPlaylistParser';
-import type { StreamAnalysis, ClientOnlyResponse } from '@/types/stream';
+import type { StreamAnalysis, ClientOnlyResponse, SessionProtectedResponse } from '@/types/stream';
+
+// Type guards for response discrimination
+function checkIsClientOnly(data: unknown): data is ClientOnlyResponse {
+  return typeof data === 'object' && data !== null && 'clientOnly' in data && (data as ClientOnlyResponse).clientOnly === true;
+}
+
+function checkIsSessionProtected(data: unknown): data is SessionProtectedResponse {
+  return typeof data === 'object' && data !== null && 'sessionProtected' in data && (data as SessionProtectedResponse).sessionProtected === true;
+}
+
+function checkIsStreamAnalysis(data: unknown): data is StreamAnalysis {
+  return typeof data === 'object' && data !== null && 'type' in data && ('master' === (data as StreamAnalysis).type || 'media' === (data as StreamAnalysis).type);
+}
 
 const Index = () => {
   const [isLoading, setIsLoading] = useState(false);
@@ -17,6 +30,8 @@ const Index = () => {
   const [error, setError] = useState<string | null>(null);
   const [streamUrl, setStreamUrl] = useState<string>('');
   const [isClientOnly, setIsClientOnly] = useState(false);
+  const [isSessionProtected, setIsSessionProtected] = useState(false);
+  const [sessionProtectedMessage, setSessionProtectedMessage] = useState<string>('');
 
   const handleAnalyze = async (url: string) => {
     setIsLoading(true);
@@ -24,16 +39,25 @@ const Index = () => {
     setAnalysis(null);
     setStreamUrl(url);
     setIsClientOnly(false);
+    setIsSessionProtected(false);
+    setSessionProtectedMessage('');
 
     try {
       const result = await analyzeStream(url);
 
       if (result.success && result.data) {
-        // Check if server returned clientOnly mode
         const data = result.data;
         
-        if ('clientOnly' in data && data.clientOnly && 'directUrl' in data) {
-          // Server can't access stream - fetch and parse client-side
+        // Handle session-protected streams
+        if (checkIsSessionProtected(data)) {
+          setIsSessionProtected(true);
+          setSessionProtectedMessage(data.message || 'This stream requires an authenticated session from the original website and cannot be downloaded directly.');
+          setIsLoading(false);
+          return;
+        }
+        
+        // Handle client-only streams
+        if (checkIsClientOnly(data)) {
           setIsClientOnly(true);
           try {
             const clientAnalysis = await fetchAndParsePlaylist(data.directUrl);
@@ -41,11 +65,17 @@ const Index = () => {
           } catch (err) {
             setError(err instanceof Error ? err.message : 'Failed to fetch playlist from browser');
           }
-        } else {
-          setAnalysis(data as StreamAnalysis);
+          setIsLoading(false);
+          return;
+        }
+        
+        // Handle normal stream analysis
+        if (checkIsStreamAnalysis(data)) {
+          setAnalysis(data);
         }
       } else {
-        setError(result.message || 'Failed to analyze stream');
+        // Only show error for actual failures
+        setError(result.message || result.error || 'Failed to analyze stream');
       }
     } catch (err) {
       console.error('Analyze error:', err);
@@ -101,6 +131,17 @@ const Index = () => {
             <AlertCircle className="h-4 w-4" />
             <AlertTitle>Error</AlertTitle>
             <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
+
+        {/* Session-Protected Alert */}
+        {isSessionProtected && (
+          <Alert className="border-purple-500/30 bg-purple-500/10">
+            <ShieldAlert className="h-4 w-4 text-purple-400" />
+            <AlertTitle className="text-purple-300">Session-Protected Stream</AlertTitle>
+            <AlertDescription className="text-purple-300/80">
+              {sessionProtectedMessage}
+            </AlertDescription>
           </Alert>
         )}
 

@@ -21,9 +21,22 @@ export interface ClientOnlyResponse {
   message: string;
 }
 
+export interface SessionProtectedResponse {
+  sessionProtected: true;
+  message: string;
+}
+
+export interface ErrorResponse {
+  error: string;
+  message?: string;
+}
+
+// Union type for all possible backend responses
+export type AnalyzeData = StreamAnalysis | ClientOnlyResponse | SessionProtectedResponse;
+
 export interface AnalyzeResponse {
   success: boolean;
-  data?: StreamAnalysis | ClientOnlyResponse;
+  data?: AnalyzeData;
   error?: string;
   message?: string;
 }

@@ -7,16 +7,23 @@ export async function analyzeStream(url: string): Promise<AnalyzeResponse> {
     const response = await fetch(`${API_BASE}/analyze?url=${encodeURIComponent(url)}`);
     const data = await response.json();
     
-    if (!response.ok) {
+    // Check for special response types that are valid (not errors)
+    if (data.clientOnly || data.sessionProtected || data.type) {
+      return { success: true, data };
+    }
+    
+    // Check for explicit error responses
+    if (data.error || !response.ok) {
       return { success: false, error: data.error, message: data.message };
     }
     
     return { success: true, data };
   } catch (error) {
+    // Only network failures trigger generic error
     return { 
       success: false, 
       error: 'Network error', 
-      message: 'Unable to fetch stream. Check the URL.' 
+      message: 'Unable to connect to server. Check your network connection.' 
     };
   }
 }
