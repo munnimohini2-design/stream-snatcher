@@ -26,10 +26,15 @@ export function ClientDownloadSection({ streamUrl, qualities }: ClientDownloadSe
 
   const getPhaseText = () => {
     switch (progress.phase) {
-      case 'fetching':
-        return `Downloading segments (${progress.segmentsLoaded}/${progress.totalSegments})...`;
+      case 'loading':
+        return 'Loading stream...';
+      case 'playing':
+        return 'Starting playback...';
       case 'recording':
-        return 'Recording video...';
+        const timeText = progress.duration > 0 
+          ? ` (${Math.floor(progress.currentTime)}s / ${Math.floor(progress.duration)}s)`
+          : '';
+        return `Recording video${timeText}...`;
       case 'finalizing':
         return 'Finalizing...';
       case 'complete':
