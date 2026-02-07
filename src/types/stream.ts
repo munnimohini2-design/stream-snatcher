@@ -9,9 +9,16 @@ export interface StreamAnalysis {
   isLive: boolean;
   isEncrypted: boolean;
   clientOnly?: boolean;
+  directUrl?: string;
   baseUrl: string;
   qualities: StreamQuality[];
   message?: string;
+}
+
+export interface ClientOnlyResponse {
+  clientOnly: true;
+  directUrl: string;
+  message: string;
 }
 
 export interface AnalyzeResponse {

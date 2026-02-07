@@ -1,19 +1,28 @@
+import { useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
-import { Download, Loader2, AlertCircle, XCircle, CheckCircle2, Monitor } from 'lucide-react';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Download, AlertCircle, XCircle, CheckCircle2, Monitor } from 'lucide-react';
 import { useClientDownloader } from '@/hooks/useClientDownloader';
+import type { StreamQuality } from '@/types/stream';
 
 interface ClientDownloadSectionProps {
   streamUrl: string;
+  qualities: StreamQuality[];
 }
 
-export function ClientDownloadSection({ streamUrl }: ClientDownloadSectionProps) {
+export function ClientDownloadSection({ streamUrl, qualities }: ClientDownloadSectionProps) {
+  const [selectedQuality, setSelectedQuality] = useState<string>(
+    qualities[0]?.url || streamUrl
+  );
   const { progress, isDownloading, startDownload, cancelDownload } = useClientDownloader();
 
   const handleDownload = () => {
-    startDownload(streamUrl);
+    startDownload(selectedQuality);
   };
+
+  const selectedQualityInfo = qualities.find(q => q.url === selectedQuality);
 
   const getPhaseText = () => {
     switch (progress.phase) {
@@ -76,8 +85,27 @@ export function ClientDownloadSection({ streamUrl }: ClientDownloadSectionProps)
           </div>
         )}
 
-        {/* Action buttons */}
+        {/* Quality selector and action buttons */}
         <div className="flex gap-3">
+          {qualities.length > 1 && !isDownloading && (
+            <Select 
+              value={selectedQuality} 
+              onValueChange={setSelectedQuality}
+              disabled={progress.phase === 'complete'}
+            >
+              <SelectTrigger className="flex-1">
+                <SelectValue placeholder="Select quality" />
+              </SelectTrigger>
+              <SelectContent>
+                {qualities.map((q, i) => (
+                  <SelectItem key={i} value={q.url}>
+                    {q.resolution || `Quality ${i + 1}`}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+          
           {isDownloading ? (
             <Button 
               variant="destructive" 
@@ -107,6 +135,12 @@ export function ClientDownloadSection({ streamUrl }: ClientDownloadSectionProps)
             </Button>
           )}
         </div>
+
+        {selectedQualityInfo && selectedQualityInfo.resolution && (
+          <p className="text-xs text-muted-foreground">
+            Selected: {selectedQualityInfo.resolution}
+          </p>
+        )}
 
         <p className="text-xs text-muted-foreground">
           Browser-based download uses MediaRecorder. The video will play at normal speed while recording.

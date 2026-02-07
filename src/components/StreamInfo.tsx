@@ -6,9 +6,10 @@ import { formatBandwidth } from '@/utils/hlsParser';
 
 interface StreamInfoProps {
   analysis: StreamAnalysis;
+  isClientOnly?: boolean;
 }
 
-export function StreamInfo({ analysis }: StreamInfoProps) {
+export function StreamInfo({ analysis, isClientOnly }: StreamInfoProps) {
   return (
     <Card className="border-border bg-card">
       <CardHeader className="pb-3">

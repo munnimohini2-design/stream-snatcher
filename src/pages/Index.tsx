@@ -6,26 +6,43 @@ import { DownloadSection } from '@/components/DownloadSection';
 import { ClientDownloadSection } from '@/components/ClientDownloadSection';
 import { Disclaimer } from '@/components/Disclaimer';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
-import { AlertCircle, Download } from 'lucide-react';
+import { AlertCircle, Download, Loader2 } from 'lucide-react';
 import { analyzeStream } from '@/services/api';
-import type { StreamAnalysis } from '@/types/stream';
+import { fetchAndParsePlaylist } from '@/utils/clientPlaylistParser';
+import type { StreamAnalysis, ClientOnlyResponse } from '@/types/stream';
 
 const Index = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [analysis, setAnalysis] = useState<StreamAnalysis | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [streamUrl, setStreamUrl] = useState<string>('');
+  const [isClientOnly, setIsClientOnly] = useState(false);
 
   const handleAnalyze = async (url: string) => {
     setIsLoading(true);
     setError(null);
     setAnalysis(null);
     setStreamUrl(url);
+    setIsClientOnly(false);
 
     const result = await analyzeStream(url);
 
     if (result.success && result.data) {
-      setAnalysis(result.data);
+      // Check if server returned clientOnly mode
+      const data = result.data as StreamAnalysis | ClientOnlyResponse;
+      
+      if ('clientOnly' in data && data.clientOnly && 'directUrl' in data) {
+        // Server can't access stream - fetch and parse client-side
+        setIsClientOnly(true);
+        try {
+          const clientAnalysis = await fetchAndParsePlaylist(data.directUrl);
+          setAnalysis(clientAnalysis);
+        } catch (err) {
+          setError(err instanceof Error ? err.message : 'Failed to fetch playlist from browser');
+        }
+      } else {
+        setAnalysis(data as StreamAnalysis);
+      }
     } else {
       setError(result.message || 'Failed to analyze stream');
     }
@@ -41,6 +58,9 @@ const Index = () => {
   };
 
   const isDownloadDisabled = !analysis || analysis.isLive || analysis.isEncrypted;
+  
+  // Force client-only mode when analysis indicates it
+  const useClientDownload = isClientOnly || analysis?.clientOnly;
 
   return (
     <div className="min-h-screen bg-background">
@@ -84,9 +104,12 @@ const Index = () => {
           <div className="grid gap-6 lg:grid-cols-2">
             {/* Left Column */}
             <div className="space-y-6">
-              <StreamInfo analysis={analysis} />
-              {analysis.clientOnly ? (
-                <ClientDownloadSection streamUrl={streamUrl} />
+              <StreamInfo analysis={analysis} isClientOnly={useClientDownload} />
+              {useClientDownload ? (
+                <ClientDownloadSection 
+                  streamUrl={analysis.directUrl || streamUrl} 
+                  qualities={analysis.qualities}
+                />
               ) : (
                 <DownloadSection
                   streamUrl={streamUrl}
