@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Stream Player</title>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7"></script>
+  <style>
+    * { margin: 0; padding: 0; }
+    body { background: #000; overflow: hidden; }
+    video { width: 100%; height: 100%; object-fit: contain; }
+  </style>
+</head>
+<body>
+  <video id="video" muted playsinline></video>
+  
+  <script>
+    const video = document.getElementById('video');
+    let hls = null;
+    let mediaRecorder = null;
+    let recordedChunks = [];
+    let isRecording = false;
+    
+    // Send message to parent
+    function sendToParent(type, data = {}) {
+      window.parent.postMessage({ source: 'iframe-player', type, ...data }, '*');
+    }
+    
+    // Determine supported MIME type
+    function getSupportedMimeType() {
+      const types = [
+        'video/webm;codecs=vp9,opus',
+        'video/webm;codecs=vp8,opus',
+        'video/webm;codecs=vp9',
+        'video/webm;codecs=vp8',
+        'video/webm',
+        'video/mp4'
+      ];
+      for (const type of types) {
+        if (MediaRecorder.isTypeSupported(type)) {
+          return type;
+        }
+      }
+      return 'video/webm';
+    }
+    
+    // Start recording the video stream
+    function startRecording() {
+      if (isRecording) return;
+      
+      try {
+        const stream = video.captureStream ? video.captureStream() : video.mozCaptureStream();
+        if (!stream) {
+          sendToParent('error', { message: 'captureStream not supported' });
+          return;
+        }
+        
+        const mimeType = getSupportedMimeType();
+        mediaRecorder = new MediaRecorder(stream, {
+          mimeType,
+          videoBitsPerSecond: 8000000
+        });
+        
+        recordedChunks = [];
+        
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            recordedChunks.push(event.data);
+            // Send chunk to parent
+            event.data.arrayBuffer().then(buffer => {
+              sendToParent('data', { 
+                chunk: Array.from(new Uint8Array(buffer)),
+                mimeType 
+              });
+            });
+          }
+        };
+        
+        mediaRecorder.onstop = () => {
+          isRecording = false;
+          sendToParent('recording-stopped', { mimeType });
+        };
+        
+        mediaRecorder.onerror = (e) => {
+          isRecording = false;
+          sendToParent('error', { message: 'MediaRecorder error: ' + e.message });
+        };
+        
+        mediaRecorder.start(500); // Collect data every 500ms
+        isRecording = true;
+        sendToParent('recording-started');
+        
+      } catch (err) {
+        sendToParent('error', { message: 'Failed to start recording: ' + err.message });
+      }
+    }
+    
+    // Stop recording
+    function stopRecording() {
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        mediaRecorder.stop();
+      }
+    }
+    
+    // Load and play stream
+    function loadStream(url) {
+      console.log('[iframe] Loading stream:', url);
+      
+      if (Hls.isSupported()) {
+        if (hls) {
+          hls.destroy();
+        }
+        
+        hls = new Hls({
+          enableWorker: true,
+          lowLatencyMode: false,
+          xhrSetup: function(xhr, url) {
+            // Let the browser handle headers naturally in this context
+            xhr.withCredentials = false;
+          }
+        });
+        
+        hls.loadSource(url);
+        hls.attachMedia(video);
+        
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          console.log('[iframe] Manifest parsed');
+          sendToParent('manifest-loaded', { duration: video.duration || 0 });
+          
+          video.play().then(() => {
+            console.log('[iframe] Playback started');
+            sendToParent('playback-started');
+            // Start recording shortly after playback begins
+            setTimeout(() => startRecording(), 200);
+          }).catch(err => {
+            console.error('[iframe] Play failed:', err);
+            sendToParent('error', { message: 'Playback failed: ' + err.message });
+          });
+        });
+        
+        hls.on(Hls.Events.ERROR, (event, data) => {
+          console.error('[iframe] HLS error:', data);
+          if (data.fatal) {
+            sendToParent('error', { 
+              message: 'Stream load failed: ' + (data.reason || data.details || 'Unknown error'),
+              fatal: true 
+            });
+          }
+        });
+        
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        // Native HLS (Safari)
+        video.src = url;
+        
+        video.onloadedmetadata = () => {
+          sendToParent('manifest-loaded', { duration: video.duration || 0 });
+          video.play().then(() => {
+            sendToParent('playback-started');
+            setTimeout(() => startRecording(), 200);
+          }).catch(err => {
+            sendToParent('error', { message: 'Playback failed: ' + err.message });
+          });
+        };
+        
+        video.onerror = () => {
+          sendToParent('error', { message: 'Failed to load stream', fatal: true });
+        };
+        
+      } else {
+        sendToParent('error', { message: 'HLS not supported in this browser', fatal: true });
+      }
+    }
+    
+    // Track playback progress
+    video.ontimeupdate = () => {
+      sendToParent('progress', {
+        currentTime: video.currentTime,
+        duration: video.duration || 0
+      });
+    };
+    
+    video.onended = () => {
+      console.log('[iframe] Video ended');
+      stopRecording();
+      sendToParent('ended');
+    };
+    
+    video.onerror = () => {
+      sendToParent('error', { message: 'Video playback error', fatal: true });
+    };
+    
+    // Listen for commands from parent
+    window.addEventListener('message', (event) => {
+      const data = event.data;
+      if (!data || data.target !== 'iframe-player') return;
+      
+      console.log('[iframe] Received command:', data.command);
+      
+      switch (data.command) {
+        case 'load':
+          loadStream(data.url);
+          break;
+        case 'stop':
+          stopRecording();
+          if (hls) {
+            hls.destroy();
+            hls = null;
+          }
+          video.pause();
+          video.src = '';
+          sendToParent('stopped');
+          break;
+      }
+    });
+    
+    // Signal ready
+    sendToParent('ready');
+  </script>
+</body>
+</html>
