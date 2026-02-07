@@ -5,11 +5,14 @@
  * Handles stream analysis, proxying, and download URL generation.
  * 
  * Reliability features:
+ * - Full browser header forwarding for session-protected streams
+ * - Cookie forwarding for CDN session authentication
  * - Range request support for seeking
  * - No Content-Length forwarding (prevents chunked encoding issues)
  * - Proper encryption detection via METHOD parsing
  * - Client disconnect handling to prevent memory leaks
  * - Proper URL encoding for worker download URLs
+ * - Better error messages for 401/403 responses
  */
 
 const http = require('http');
@@ -20,6 +23,28 @@ const { URL } = require('url');
 const PORT = process.env.PORT || 3001;
 const WORKER_BASE_URL = process.env.WORKER_BASE_URL || 'https://your-worker.example.com';
 const REQUEST_TIMEOUT = 15000; // 15 seconds
+
+// Default browser-like headers (Chrome on Windows)
+const DEFAULT_BROWSER_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Accept': '*/*',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Accept-Encoding': 'identity', // Don't request compression for streams
+  'Connection': 'keep-alive',
+};
+
+// Headers to forward from browser requests
+const FORWARD_HEADERS = [
+  'user-agent',
+  'referer',
+  'origin',
+  'accept',
+  'accept-language',
+  'accept-encoding',
+  'connection',
+  'range',
+  'cookie', // Important for session-protected streams
+];
 
 // Blocked premium domains
 const BLOCKED_DOMAINS = [
@@ -34,6 +59,30 @@ const BLOCKED_DOMAINS = [
   'paramountplus.com',
   'appletv.apple.com',
 ];
+
+/**
+ * Build browser-like headers from incoming request
+ * Falls back to default Chrome headers if not provided
+ */
+function buildBrowserHeaders(incomingReq, includeRange = false) {
+  const headers = { ...DEFAULT_BROWSER_HEADERS };
+  
+  // Forward browser headers if present
+  for (const header of FORWARD_HEADERS) {
+    if (header === 'range' && !includeRange) continue;
+    
+    const value = incomingReq.headers[header];
+    if (value) {
+      // Normalize header names for outgoing request
+      const normalizedHeader = header.split('-').map(
+        part => part.charAt(0).toUpperCase() + part.slice(1)
+      ).join('-');
+      headers[normalizedHeader] = value;
+    }
+  }
+  
+  return headers;
+}
 
 /**
  * Resolve relative URLs to absolute URLs
@@ -57,27 +106,26 @@ function resolveUrl(baseUrl, relativePath) {
 }
 
 /**
- * Fetch URL with timeout and optional header forwarding
+ * Fetch URL with timeout and browser-like headers
  * Returns { req, res } so caller can handle cleanup
  */
 function fetchWithTimeout(urlString, headers = {}, timeout = REQUEST_TIMEOUT) {
   return new Promise((resolve, reject) => {
+    // Preserve full URL including query parameters (tokens, signatures, etc.)
     const parsedUrl = new URL(urlString);
     const client = parsedUrl.protocol === 'https:' ? https : http;
     
     const options = {
       hostname: parsedUrl.hostname,
       port: parsedUrl.port,
+      // Use full path + search to preserve query parameters exactly
       path: parsedUrl.pathname + parsedUrl.search,
       method: 'GET',
-      headers: {
-        'Accept': '*/*',
-        ...headers,
-      },
+      headers: headers,
     };
 
     const req = client.request(options, (res) => {
-      // Handle redirects
+      // Handle redirects - preserve headers for redirects
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         const redirectUrl = resolveUrl(urlString, res.headers.location) || res.headers.location;
         fetchWithTimeout(redirectUrl, headers, timeout)
@@ -270,13 +318,20 @@ async function handleAnalyze(req, res, url) {
   }
   
   try {
-    // Forward relevant headers
-    const headers = {};
-    if (req.headers['user-agent']) headers['User-Agent'] = req.headers['user-agent'];
-    if (req.headers['referer']) headers['Referer'] = req.headers['referer'];
-    if (req.headers['origin']) headers['Origin'] = req.headers['origin'];
+    // Build browser-like headers from incoming request
+    const headers = buildBrowserHeaders(req, false);
     
     const { res: response } = await fetchWithTimeout(m3u8Url, headers);
+    
+    // Handle authentication/authorization errors with helpful message
+    if (response.statusCode === 401 || response.statusCode === 403) {
+      return sendError(
+        res, 
+        response.statusCode, 
+        'Access denied', 
+        'Stream requires browser session headers. Try opening the stream in your browser first, then paste the URL here.'
+      );
+    }
     
     if (response.statusCode !== 200) {
       return sendError(res, 502, 'Fetch failed', `Unable to fetch stream (HTTP ${response.statusCode})`);
@@ -312,15 +367,21 @@ async function handleProxy(req, res, url) {
   let upstreamReq = null;
   
   try {
-    // Forward relevant headers including Range for seeking support
-    const headers = {};
-    if (req.headers['user-agent']) headers['User-Agent'] = req.headers['user-agent'];
-    if (req.headers['referer']) headers['Referer'] = req.headers['referer'];
-    if (req.headers['origin']) headers['Origin'] = req.headers['origin'];
-    if (req.headers['range']) headers['Range'] = req.headers['range'];
+    // Build browser-like headers including Range for seeking support
+    const headers = buildBrowserHeaders(req, true);
     
     const { req: upstream, res: response } = await fetchWithTimeout(resourceUrl, headers);
     upstreamReq = upstream;
+    
+    // Handle authentication/authorization errors
+    if (response.statusCode === 401 || response.statusCode === 403) {
+      return sendError(
+        res, 
+        response.statusCode, 
+        'Access denied', 
+        'Stream requires browser session headers. The session may have expired.'
+      );
+    }
     
     // Prevent memory leak: abort upstream if client disconnects
     res.on('close', () => {
