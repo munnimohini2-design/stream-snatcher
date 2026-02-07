@@ -1,8 +1,9 @@
+
 /**
  * HLS Stream Downloader - Backend Server
  * 
  * A minimal, stateless Node.js server using only native modules.
- * Handles stream analysis, proxying, and download URL generation.
+ * Handles stream analysis, proxying, download URL generation, and background FFmpeg downloads.
  * 
  * Reliability features:
  * - Full browser header forwarding for session-protected streams
@@ -11,18 +12,19 @@
  * - No Content-Length forwarding (prevents chunked encoding issues)
  * - Proper encryption detection via METHOD parsing
  * - Client disconnect handling to prevent memory leaks
- * - Proper URL encoding for worker download URLs
  * - Better error messages for 401/403 responses
+ * - Background FFmpeg processing for downloads
  */
 
-const http = require('http');
-const https = require('https');
-const { URL } = require('url');
+import http from 'http';
+import https from 'https';
+import { URL } from 'url';
+import { spawn } from 'child_process';
 
 // Configuration
 const PORT = process.env.PORT || 3001;
-const WORKER_BASE_URL = process.env.WORKER_BASE_URL || 'https://your-worker.example.com';
-const REQUEST_TIMEOUT = 15000; // 15 seconds
+const REQUEST_TIMEOUT = 15000; // 15 seconds for initial connection
+const FFMPEG_PATH = process.env.FFMPEG_PATH || 'ffmpeg';
 
 // Default browser-like headers (Chrome on Windows)
 const DEFAULT_BROWSER_HEADERS = {
@@ -61,16 +63,44 @@ const BLOCKED_DOMAINS = [
 ];
 
 /**
+ * Validate URL format
+ */
+function isValidUrl(urlString) {
+  try {
+    const url = new URL(urlString);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Generate filename from URL
+ */
+function generateFilename(urlString) {
+  try {
+    const url = new URL(urlString);
+    const pathParts = url.pathname.split('/');
+    const baseName = pathParts[pathParts.length - 1] || 'video';
+    // Remove extension and clean up
+    const cleanName = baseName.replace(/\.(m3u8|m3u)$/i, '').replace(/[^a-zA-Z0-9_-]/g, '_');
+    return `${cleanName || 'video'}.mp4`;
+  } catch {
+    return 'video.mp4';
+  }
+}
+
+/**
  * Build browser-like headers from incoming request
  * Falls back to default Chrome headers if not provided
  */
 function buildBrowserHeaders(incomingReq, includeRange = false) {
   const headers = { ...DEFAULT_BROWSER_HEADERS };
-  
+
   // Forward browser headers if present
   for (const header of FORWARD_HEADERS) {
     if (header === 'range' && !includeRange) continue;
-    
+
     const value = incomingReq.headers[header];
     if (value) {
       // Normalize header names for outgoing request
@@ -80,7 +110,7 @@ function buildBrowserHeaders(incomingReq, includeRange = false) {
       headers[normalizedHeader] = value;
     }
   }
-  
+
   return headers;
 }
 
@@ -89,12 +119,12 @@ function buildBrowserHeaders(incomingReq, includeRange = false) {
  */
 function resolveUrl(baseUrl, relativePath) {
   if (!relativePath) return null;
-  
+
   // If already absolute, return as-is
   if (relativePath.startsWith('http://') || relativePath.startsWith('https://')) {
     return relativePath;
   }
-  
+
   try {
     const base = new URL(baseUrl);
     const basePath = base.pathname.substring(0, base.pathname.lastIndexOf('/') + 1);
@@ -114,7 +144,7 @@ function fetchWithTimeout(urlString, headers = {}, timeout = REQUEST_TIMEOUT) {
     // Preserve full URL including query parameters (tokens, signatures, etc.)
     const parsedUrl = new URL(urlString);
     const client = parsedUrl.protocol === 'https:' ? https : http;
-    
+
     const options = {
       hostname: parsedUrl.hostname,
       port: parsedUrl.port,
@@ -133,13 +163,13 @@ function fetchWithTimeout(urlString, headers = {}, timeout = REQUEST_TIMEOUT) {
           .catch(reject);
         return;
       }
-      
+
       // Return both request and response for cleanup handling
       resolve({ req, res });
     });
 
     req.on('error', reject);
-    
+
     req.setTimeout(timeout, () => {
       req.destroy();
       reject(new Error('Request timeout'));
@@ -168,10 +198,10 @@ function readBody(res) {
 function detectEncryption(content) {
   const keyTagRegex = /#EXT-X-KEY:([^\n]+)/g;
   let match;
-  
+
   while ((match = keyTagRegex.exec(content)) !== null) {
     const attributes = match[1];
-    
+
     // Parse METHOD attribute
     const methodMatch = attributes.match(/METHOD=([^,\s]+)/);
     if (methodMatch) {
@@ -182,7 +212,7 @@ function detectEncryption(content) {
       }
     }
   }
-  
+
   return false;
 }
 
@@ -191,7 +221,7 @@ function detectEncryption(content) {
  */
 function parseM3u8(content, baseUrl) {
   const lines = content.split('\n').map(l => l.trim()).filter(Boolean);
-  
+
   const result = {
     type: 'media',
     isLive: true, // Assume live until we find #EXT-X-ENDLIST
@@ -199,22 +229,22 @@ function parseM3u8(content, baseUrl) {
     baseUrl: baseUrl.substring(0, baseUrl.lastIndexOf('/') + 1),
     qualities: [],
   };
-  
+
   // Check for encryption using proper METHOD parsing
   result.isEncrypted = detectEncryption(content);
-  
+
   // Check for VOD (has end marker)
   if (content.includes('#EXT-X-ENDLIST')) {
     result.isLive = false;
   }
-  
+
   // Check for master playlist (has stream info)
   if (content.includes('#EXT-X-STREAM-INF')) {
     result.type = 'master';
-    
+
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
-      
+
       if (line.startsWith('#EXT-X-STREAM-INF:')) {
         const attrs = line.substring(18);
         const quality = {
@@ -222,19 +252,19 @@ function parseM3u8(content, baseUrl) {
           bandwidth: 0,
           url: null,
         };
-        
+
         // Parse BANDWIDTH
         const bandwidthMatch = attrs.match(/BANDWIDTH=(\d+)/);
         if (bandwidthMatch) {
           quality.bandwidth = parseInt(bandwidthMatch[1], 10);
         }
-        
+
         // Parse RESOLUTION
         const resolutionMatch = attrs.match(/RESOLUTION=(\d+x\d+)/);
         if (resolutionMatch) {
           quality.resolution = resolutionMatch[1];
         }
-        
+
         // Next non-comment line should be the URL
         for (let j = i + 1; j < lines.length; j++) {
           if (!lines[j].startsWith('#')) {
@@ -242,13 +272,13 @@ function parseM3u8(content, baseUrl) {
             break;
           }
         }
-        
+
         if (quality.url) {
           result.qualities.push(quality);
         }
       }
     }
-    
+
     // Sort by bandwidth (highest first)
     result.qualities.sort((a, b) => b.bandwidth - a.bandwidth);
   } else {
@@ -259,7 +289,7 @@ function parseM3u8(content, baseUrl) {
       url: baseUrl,
     });
   }
-  
+
   return result;
 }
 
@@ -300,29 +330,29 @@ function sendError(res, statusCode, error, message) {
  */
 async function handleAnalyze(req, res, url) {
   const m3u8Url = url.searchParams.get('url');
-  
+
   if (!m3u8Url) {
     return sendError(res, 400, 'Missing URL', 'Please provide a valid .m3u8 URL');
   }
-  
+
   // Validate URL format
   try {
     new URL(m3u8Url);
   } catch {
     return sendError(res, 400, 'Invalid URL', 'Please enter a valid .m3u8 URL');
   }
-  
+
   // Check blocked domains
   if (isBlockedDomain(m3u8Url)) {
     return sendError(res, 403, 'Blocked domain', 'This source is not supported');
   }
-  
+
   try {
     // Build browser-like headers from incoming request
     const headers = buildBrowserHeaders(req, false);
-    
+
     const { res: response } = await fetchWithTimeout(m3u8Url, headers);
-    
+
     // Handle authentication/authorization errors (401/403)
     // Return clientOnly mode to allow browser-based download
     if (response.statusCode === 401 || response.statusCode === 403) {
@@ -332,20 +362,20 @@ async function handleAnalyze(req, res, url) {
         message: 'Stream restricted to viewer IP, use browser downloader',
       });
     }
-    
+
     if (response.statusCode !== 200) {
       return sendError(res, 502, 'Fetch failed', `Unable to fetch stream (HTTP ${response.statusCode})`);
     }
-    
+
     const content = await readBody(response);
-    
+
     if (!content.includes('#EXTM3U')) {
       return sendError(res, 400, 'Invalid playlist', 'The URL does not contain a valid M3U8 playlist');
     }
-    
+
     const analysis = parseM3u8(content, m3u8Url);
     sendJson(res, 200, analysis);
-    
+
   } catch (err) {
     if (err.message === 'Request timeout') {
       return sendError(res, 504, 'Request timeout', 'Stream took too long to respond');
@@ -359,45 +389,45 @@ async function handleAnalyze(req, res, url) {
  */
 async function handleProxy(req, res, url) {
   const resourceUrl = url.searchParams.get('url');
-  
+
   if (!resourceUrl) {
     return sendError(res, 400, 'Missing URL', 'Please provide a resource URL');
   }
-  
+
   let upstreamReq = null;
-  
+
   try {
     // Build browser-like headers including Range for seeking support
     const headers = buildBrowserHeaders(req, true);
-    
+
     const { req: upstream, res: response } = await fetchWithTimeout(resourceUrl, headers);
     upstreamReq = upstream;
-    
+
     // Handle authentication/authorization errors
     if (response.statusCode === 401 || response.statusCode === 403) {
       return sendError(
-        res, 
-        response.statusCode, 
-        'Access denied', 
+        res,
+        response.statusCode,
+        'Access denied',
         'Stream requires browser session headers. The session may have expired.'
       );
     }
-    
+
     // Prevent memory leak: abort upstream if client disconnects
     res.on('close', () => {
       if (upstreamReq) {
         upstreamReq.destroy();
       }
     });
-    
+
     // Determine content type
     let contentType = response.headers['content-type'] || 'application/octet-stream';
-    
+
     // For m3u8 files, rewrite relative URLs to absolute
     if (resourceUrl.includes('.m3u8') || contentType.includes('mpegurl')) {
       const content = await readBody(response);
       const baseUrl = resourceUrl;
-      
+
       // Rewrite relative URLs in the playlist
       const rewritten = content.split('\n').map(line => {
         const trimmed = line.trim();
@@ -416,7 +446,7 @@ async function handleProxy(req, res, url) {
         const resolved = resolveUrl(baseUrl, trimmed);
         return resolved || line;
       }).join('\n');
-      
+
       res.writeHead(200, {
         'Content-Type': 'application/vnd.apple.mpegurl',
         'Access-Control-Allow-Origin': '*',
@@ -428,7 +458,7 @@ async function handleProxy(req, res, url) {
       res.end(rewritten);
       return;
     }
-    
+
     // For segments (.ts, .m4s, etc.), stream directly
     // DO NOT forward Content-Length - some CDNs use chunked encoding
     // which causes playback freezing when length is forwarded
@@ -440,7 +470,7 @@ async function handleProxy(req, res, url) {
       'Access-Control-Expose-Headers': 'Content-Range, Accept-Ranges',
       'Cache-Control': 'no-cache',
     };
-    
+
     // Forward range-related headers for seeking support
     if (response.headers['content-range']) {
       responseHeaders['Content-Range'] = response.headers['content-range'];
@@ -448,19 +478,19 @@ async function handleProxy(req, res, url) {
     if (response.headers['accept-ranges']) {
       responseHeaders['Accept-Ranges'] = response.headers['accept-ranges'];
     }
-    
+
     // Use 206 for partial content, 200 otherwise
     const statusCode = response.statusCode === 206 ? 206 : 200;
-    
+
     res.writeHead(statusCode, responseHeaders);
-    
+
     // Pipe with error handling
     response.pipe(res);
-    
+
     response.on('error', () => {
       res.end();
     });
-    
+
   } catch (err) {
     if (upstreamReq) {
       upstreamReq.destroy();
@@ -473,36 +503,201 @@ async function handleProxy(req, res, url) {
 }
 
 /**
+ * Handle /download (Worker Logic)
+ */
+function handleDownload(req, res, url) {
+  const m3u8Url = url.searchParams.get('url');
+  const qualityUrl = url.searchParams.get('quality');
+
+  // Use quality URL if provided, otherwise use main URL
+  const streamUrl = qualityUrl || m3u8Url;
+
+  if (!streamUrl) {
+    return sendError(res, 400, 'Missing URL', 'Please provide a valid .m3u8 URL');
+  }
+
+  // Validate URL
+  if (!isValidUrl(streamUrl)) {
+    return sendError(res, 400, 'Invalid URL', 'Please provide a valid HTTP(S) URL');
+  }
+
+  // Check blocked domains
+  if (isBlockedDomain(streamUrl)) {
+    return sendError(res, 403, 'Blocked domain', 'This source is not supported');
+  }
+
+  // Generate download filename
+  const filename = generateFilename(streamUrl);
+
+  // Build headers for FFmpeg
+  let headersArg = '';
+  const userAgent = req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+  if (req.headers['cookie']) {
+    headersArg += `Cookie: ${req.headers['cookie']}\r\n`;
+  }
+  if (req.headers['referer']) {
+    headersArg += `Referer: ${req.headers['referer']}\r\n`;
+  }
+  if (req.headers['origin']) {
+    headersArg += `Origin: ${req.headers['origin']}\r\n`;
+  }
+
+  // FFmpeg arguments
+  const ffmpegArgs = [
+    '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data',
+    '-user_agent', userAgent,
+  ];
+
+  if (headersArg) {
+    ffmpegArgs.push('-headers', headersArg);
+  }
+
+  ffmpegArgs.push(
+    '-reconnect', '1',
+    '-reconnect_streamed', '1',
+    '-reconnect_delay_max', '5',
+    '-timeout', '15000000', // 15 seconds
+    '-i', streamUrl,
+    '-map', '0:v:0',      // Map first video stream
+    '-map', '0:a?',       // Map audio if present
+    '-c:v', 'copy',
+    '-c:a', 'copy',
+    '-bsf:a', 'aac_adtstoasc',
+    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+    '-f', 'mp4',
+    '-'
+  );
+
+  console.log(`[${new Date().toISOString()}] Starting download: ${streamUrl}`);
+
+  res.writeHead(200, {
+    'Content-Type': 'video/mp4',
+    'Content-Disposition': `attachment; filename="${filename}"`,
+    'Transfer-Encoding': 'chunked',
+    'Access-Control-Allow-Origin': '*',
+    'Cache-Control': 'no-cache',
+    'X-Content-Type-Options': 'nosniff',
+  });
+
+  // Spawn FFmpeg process
+  const ffmpeg = spawn(FFMPEG_PATH, ffmpegArgs, {
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+
+  let hasStarted = false;
+  let hasError = false;
+  let stderrBuffer = '';
+
+  // Timeout for initial data
+  const startTimeout = setTimeout(() => {
+    if (!hasStarted && !hasError) {
+      hasError = true;
+      console.error(`[${new Date().toISOString()}] Timeout waiting for FFmpeg output`);
+      ffmpeg.kill('SIGKILL');
+      if (!res.writableEnded) {
+        res.end();
+      }
+    }
+  }, 30000); // 30s timeout for download start
+
+  // Handle FFmpeg stdout
+  ffmpeg.stdout.on('data', (chunk) => {
+    if (!hasStarted) {
+      hasStarted = true;
+      clearTimeout(startTimeout);
+      console.log(`[${new Date().toISOString()}] Streaming started: ${filename}`);
+    }
+
+    if (!res.writableEnded) {
+      res.write(chunk);
+    }
+  });
+
+  // Collect stderr
+  ffmpeg.stderr.on('data', (data) => {
+    stderrBuffer += data.toString();
+    if (stderrBuffer.length > 2000) {
+      stderrBuffer = stderrBuffer.slice(-2000);
+    }
+  });
+
+  // Handle FFmpeg exit
+  ffmpeg.on('close', (code) => {
+    clearTimeout(startTimeout);
+
+    if (code === 0) {
+      console.log(`[${new Date().toISOString()}] Download completed: ${filename}`);
+    } else if (!hasError) {
+      console.error(`[${new Date().toISOString()}] FFmpeg exited with code ${code}`);
+    }
+
+    if (!res.writableEnded) {
+      res.end();
+    }
+  });
+
+  // Handle FFmpeg errors
+  ffmpeg.on('error', (err) => {
+    clearTimeout(startTimeout);
+    hasError = true;
+    console.error(`[${new Date().toISOString()}] FFmpeg spawn error: ${err.message}`);
+
+    if (!res.headersSent) {
+      if (err.code === 'ENOENT') {
+        sendError(res, 500, 'FFmpeg not found', 'FFmpeg is not installed or not in PATH');
+      } else {
+        sendError(res, 500, 'Process error', 'Failed to start FFmpeg process');
+      }
+    } else if (!res.writableEnded) {
+      res.end();
+    }
+  });
+
+  // Kill FFmpeg if client disconnects
+  res.on('close', () => {
+    if (!ffmpeg.killed) {
+      console.log(`[${new Date().toISOString()}] Client disconnected, killing FFmpeg`);
+      ffmpeg.kill('SIGKILL');
+    }
+  });
+}
+
+/**
  * Handle /download-url endpoint with proper URL encoding
  */
 function handleDownloadUrl(req, res, url) {
   const m3u8Url = url.searchParams.get('url');
   const quality = url.searchParams.get('quality');
-  
+
   if (!m3u8Url) {
     return sendError(res, 400, 'Missing URL', 'Please provide a valid .m3u8 URL');
   }
-  
+
   // Validate URL format
   try {
     new URL(m3u8Url);
   } catch {
     return sendError(res, 400, 'Invalid URL', 'Please enter a valid .m3u8 URL');
   }
-  
+
   // Check blocked domains
   if (isBlockedDomain(m3u8Url)) {
     return sendError(res, 403, 'Blocked domain', 'This source is not supported');
   }
-  
-  // Construct worker download URL with proper encoding
-  // Use encodeURIComponent to handle URLs with query strings/tokens
-  let downloadUrl = `${WORKER_BASE_URL}/download?url=${encodeURIComponent(m3u8Url)}`;
-  
+
+  // Generate download URL using the current server host
+  // This allows the server to work anywhere without manual config
+  const protocol = req.headers['x-forwarded-proto'] || 'http';
+  const host = req.headers['host'];
+  const baseUrl = `${protocol}://${host}`;
+
+  let downloadUrl = `${baseUrl}/download?url=${encodeURIComponent(m3u8Url)}`;
+
   if (quality) {
     downloadUrl += `&quality=${encodeURIComponent(quality)}`;
   }
-  
+
   sendJson(res, 200, { downloadUrl });
 }
 
@@ -521,15 +716,15 @@ function handleRequest(req, res) {
     res.end();
     return;
   }
-  
+
   // Only allow GET requests
   if (req.method !== 'GET') {
     return sendError(res, 405, 'Method not allowed', 'Only GET requests are supported');
   }
-  
+
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathname = url.pathname;
-  
+
   // Route requests
   switch (pathname) {
     case '/analyze':
@@ -538,6 +733,8 @@ function handleRequest(req, res) {
       return handleProxy(req, res, url);
     case '/download-url':
       return handleDownloadUrl(req, res, url);
+    case '/download':
+      return handleDownload(req, res, url);
     case '/health':
       return sendJson(res, 200, { status: 'ok', timestamp: Date.now() });
     default:
@@ -549,8 +746,8 @@ function handleRequest(req, res) {
 const server = http.createServer(handleRequest);
 
 server.listen(PORT, () => {
-  console.log(`HLS Stream Downloader server running on port ${PORT}`);
-  console.log(`Worker base URL: ${WORKER_BASE_URL}`);
+  console.log(`Stream Snatcher server running on port ${PORT}`);
+  console.log(`Serving API and Download Worker (Merged)`);
 });
 
 // Graceful shutdown

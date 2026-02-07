@@ -1,0 +1,10 @@
+
+services:
+  - type: web
+    name: stream-snatcher-backend
+    env: docker
+    plan: free
+    dockerDirPath: .
+    envVars:
+      - key: PORT
+        value: 3001

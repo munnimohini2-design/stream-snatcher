@@ -33,12 +33,12 @@ export function StreamInfo({ analysis, isClientOnly }: StreamInfoProps) {
               VOD
             </Badge>
           )}
-          
+
           {/* Playlist Type */}
           <Badge variant="outline" className="border-muted-foreground/30">
             {analysis.type === 'master' ? 'Master Playlist' : 'Media Playlist'}
           </Badge>
-          
+
           {/* Encryption Status */}
           {analysis.isEncrypted ? (
             <Badge className="bg-red-500/20 text-red-400 border-red-500/30 hover:bg-red-500/30">
@@ -58,11 +58,11 @@ export function StreamInfo({ analysis, isClientOnly }: StreamInfoProps) {
           <div className="flex items-start gap-2 p-3 rounded-lg bg-amber-500/10 border border-amber-500/20">
             <AlertTriangle className="h-4 w-4 text-amber-400 mt-0.5 shrink-0" />
             <p className="text-sm text-amber-300">
-              Live streams cannot be downloaded. Only VOD content is supported.
+              This is a live stream. Downloading is enabled but may be unstable or result in very large files.
             </p>
           </div>
         )}
-        
+
         {analysis.isEncrypted && (
           <div className="flex items-start gap-2 p-3 rounded-lg bg-red-500/10 border border-red-500/20">
             <Lock className="h-4 w-4 text-red-400 mt-0.5 shrink-0" />
@@ -80,7 +80,7 @@ export function StreamInfo({ analysis, isClientOnly }: StreamInfoProps) {
             </h4>
             <div className="grid gap-2">
               {analysis.qualities.map((quality, index) => (
-                <div 
+                <div
                   key={index}
                   className="flex items-center justify-between p-2 rounded bg-muted/30 border border-border/50"
                 >

@@ -47,7 +47,7 @@ const Index = () => {
 
       if (result.success && result.data) {
         const data = result.data;
-        
+
         // Handle session-protected streams
         if (checkIsSessionProtected(data)) {
           setIsSessionProtected(true);
@@ -55,7 +55,7 @@ const Index = () => {
           setIsLoading(false);
           return;
         }
-        
+
         // Handle client-only streams
         if (checkIsClientOnly(data)) {
           setIsClientOnly(true);
@@ -68,7 +68,7 @@ const Index = () => {
           setIsLoading(false);
           return;
         }
-        
+
         // Handle normal stream analysis
         if (checkIsStreamAnalysis(data)) {
           setAnalysis(data);
@@ -87,13 +87,15 @@ const Index = () => {
 
   const getDisabledReason = (): string | undefined => {
     if (!analysis) return undefined;
-    if (analysis.isLive) return 'Live streams cannot be downloaded';
+    // Live streams are now allowed, but with a warning
     if (analysis.isEncrypted) return 'DRM/encrypted streams are not supported';
     return undefined;
   };
 
-  const isDownloadDisabled = !analysis || analysis.isLive || analysis.isEncrypted;
-  
+  // Only disable for encrypted streams or missing analysis
+  // Live streams are allowed (with warning)
+  const isDownloadDisabled = !analysis || analysis.isEncrypted;
+
   // Force client-only mode when analysis indicates it
   const useClientDownload = isClientOnly || analysis?.clientOnly;
 
@@ -152,8 +154,8 @@ const Index = () => {
             <div className="space-y-6">
               <StreamInfo analysis={analysis} isClientOnly={useClientDownload} />
               {useClientDownload ? (
-                <ClientDownloadSection 
-                  streamUrl={analysis.directUrl || streamUrl} 
+                <ClientDownloadSection
+                  streamUrl={analysis.directUrl || streamUrl}
                   qualities={analysis.qualities}
                 />
               ) : (
