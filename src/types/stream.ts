@@ -8,8 +8,10 @@ export interface StreamAnalysis {
   type: 'master' | 'media';
   isLive: boolean;
   isEncrypted: boolean;
+  clientOnly?: boolean;
   baseUrl: string;
   qualities: StreamQuality[];
+  message?: string;
 }
 
 export interface AnalyzeResponse {
