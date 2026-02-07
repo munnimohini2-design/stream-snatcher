@@ -3,6 +3,7 @@ import { UrlInput } from '@/components/UrlInput';
 import { StreamInfo } from '@/components/StreamInfo';
 import { VideoPreview } from '@/components/VideoPreview';
 import { DownloadSection } from '@/components/DownloadSection';
+import { ClientDownloadSection } from '@/components/ClientDownloadSection';
 import { Disclaimer } from '@/components/Disclaimer';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { AlertCircle, Download } from 'lucide-react';
@@ -84,12 +85,16 @@ const Index = () => {
             {/* Left Column */}
             <div className="space-y-6">
               <StreamInfo analysis={analysis} />
-              <DownloadSection
-                streamUrl={streamUrl}
-                qualities={analysis.qualities}
-                isDisabled={isDownloadDisabled}
-                disabledReason={getDisabledReason()}
-              />
+              {analysis.clientOnly ? (
+                <ClientDownloadSection streamUrl={streamUrl} />
+              ) : (
+                <DownloadSection
+                  streamUrl={streamUrl}
+                  qualities={analysis.qualities}
+                  isDisabled={isDownloadDisabled}
+                  disabledReason={getDisabledReason()}
+                />
+              )}
             </div>
 
             {/* Right Column - Video Preview */}

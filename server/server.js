@@ -323,13 +323,30 @@ async function handleAnalyze(req, res, url) {
     
     const { res: response } = await fetchWithTimeout(m3u8Url, headers);
     
-    // Handle authentication/authorization errors with helpful message
-    if (response.statusCode === 401 || response.statusCode === 403) {
+    // Handle authentication/authorization errors
+    // For 403, return clientOnly mode to allow browser-based download
+    if (response.statusCode === 403) {
+      return sendJson(res, 200, {
+        type: 'media',
+        isLive: false,
+        isEncrypted: false,
+        clientOnly: true,
+        baseUrl: m3u8Url.substring(0, m3u8Url.lastIndexOf('/') + 1),
+        qualities: [{
+          resolution: null,
+          bandwidth: 0,
+          url: m3u8Url,
+        }],
+        message: 'Stream is IP-restricted. Using browser-based download mode.',
+      });
+    }
+    
+    if (response.statusCode === 401) {
       return sendError(
         res, 
-        response.statusCode, 
+        401, 
         'Access denied', 
-        'Stream requires browser session headers. Try opening the stream in your browser first, then paste the URL here.'
+        'Stream requires authentication. Try opening the stream in your browser first.'
       );
     }
     
