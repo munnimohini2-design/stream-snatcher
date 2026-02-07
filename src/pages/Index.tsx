@@ -25,26 +25,31 @@ const Index = () => {
     setStreamUrl(url);
     setIsClientOnly(false);
 
-    const result = await analyzeStream(url);
+    try {
+      const result = await analyzeStream(url);
 
-    if (result.success && result.data) {
-      // Check if server returned clientOnly mode
-      const data = result.data as StreamAnalysis | ClientOnlyResponse;
-      
-      if ('clientOnly' in data && data.clientOnly && 'directUrl' in data) {
-        // Server can't access stream - fetch and parse client-side
-        setIsClientOnly(true);
-        try {
-          const clientAnalysis = await fetchAndParsePlaylist(data.directUrl);
-          setAnalysis(clientAnalysis);
-        } catch (err) {
-          setError(err instanceof Error ? err.message : 'Failed to fetch playlist from browser');
+      if (result.success && result.data) {
+        // Check if server returned clientOnly mode
+        const data = result.data;
+        
+        if ('clientOnly' in data && data.clientOnly && 'directUrl' in data) {
+          // Server can't access stream - fetch and parse client-side
+          setIsClientOnly(true);
+          try {
+            const clientAnalysis = await fetchAndParsePlaylist(data.directUrl);
+            setAnalysis(clientAnalysis);
+          } catch (err) {
+            setError(err instanceof Error ? err.message : 'Failed to fetch playlist from browser');
+          }
+        } else {
+          setAnalysis(data as StreamAnalysis);
         }
       } else {
-        setAnalysis(data as StreamAnalysis);
+        setError(result.message || 'Failed to analyze stream');
       }
-    } else {
-      setError(result.message || 'Failed to analyze stream');
+    } catch (err) {
+      console.error('Analyze error:', err);
+      setError(err instanceof Error ? err.message : 'An unexpected error occurred');
     }
 
     setIsLoading(false);
