@@ -23,7 +23,7 @@ export interface ClientOnlyResponse {
 
 export interface AnalyzeResponse {
   success: boolean;
-  data?: StreamAnalysis;
+  data?: StreamAnalysis | ClientOnlyResponse;
   error?: string;
   message?: string;
 }
