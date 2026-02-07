@@ -1,5 +1,4 @@
-import { useState, useCallback, useRef } from 'react';
-import Hls from 'hls.js';
+import { useState, useCallback, useRef, useEffect } from 'react';
 
 interface DownloadProgress {
   phase: 'idle' | 'loading' | 'playing' | 'recording' | 'finalizing' | 'complete' | 'error';
@@ -24,32 +23,28 @@ export function useClientDownloader(): UseClientDownloaderResult {
     currentTime: 0,
   });
   
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const hlsRef = useRef<Hls | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const recordedChunksRef = useRef<Blob[]>([]);
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const recordedChunksRef = useRef<Uint8Array[]>([]);
+  const mimeTypeRef = useRef<string>('video/webm');
   const cancelledRef = useRef(false);
+  const messageHandlerRef = useRef<((event: MessageEvent) => void) | null>(null);
   
   const cleanup = useCallback(() => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      try {
-        mediaRecorderRef.current.stop();
-      } catch (e) {
-        // Ignore
-      }
-    }
-    mediaRecorderRef.current = null;
-    
-    if (hlsRef.current) {
-      hlsRef.current.destroy();
-      hlsRef.current = null;
+    // Remove message listener
+    if (messageHandlerRef.current) {
+      window.removeEventListener('message', messageHandlerRef.current);
+      messageHandlerRef.current = null;
     }
     
-    if (videoRef.current) {
-      videoRef.current.pause();
-      videoRef.current.src = '';
-      videoRef.current.remove();
-      videoRef.current = null;
+    // Send stop command to iframe
+    if (iframeRef.current?.contentWindow) {
+      iframeRef.current.contentWindow.postMessage({ target: 'iframe-player', command: 'stop' }, '*');
+    }
+    
+    // Remove iframe
+    if (iframeRef.current) {
+      iframeRef.current.remove();
+      iframeRef.current = null;
     }
     
     recordedChunksRef.current = [];
@@ -66,8 +61,61 @@ export function useClientDownloader(): UseClientDownloaderResult {
     });
   }, [cleanup]);
   
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      cleanup();
+    };
+  }, [cleanup]);
+  
+  const saveRecording = useCallback(() => {
+    if (recordedChunksRef.current.length === 0) {
+      setProgress(prev => ({
+        ...prev,
+        phase: 'error',
+        error: 'No data recorded',
+      }));
+      return;
+    }
+    
+    setProgress(prev => ({
+      ...prev,
+      phase: 'finalizing',
+      percentage: 95,
+    }));
+    
+    // Combine all chunks
+    const totalLength = recordedChunksRef.current.reduce((acc, chunk) => acc + chunk.length, 0);
+    const combined = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const chunk of recordedChunksRef.current) {
+      combined.set(chunk, offset);
+      offset += chunk.length;
+    }
+    
+    // Create blob and download
+    const mimeType = mimeTypeRef.current;
+    const blob = new Blob([combined], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `video.${mimeType.includes('webm') ? 'webm' : 'mp4'}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    
+    cleanup();
+    
+    setProgress(prev => ({
+      ...prev,
+      phase: 'complete',
+      percentage: 100,
+    }));
+  }, [cleanup]);
+  
   const startDownload = useCallback((playlistUrl: string) => {
-    // Must be called directly from user gesture for captureStream to work
+    // Must be called from user gesture
     cancelledRef.current = false;
     recordedChunksRef.current = [];
     
@@ -78,272 +126,131 @@ export function useClientDownloader(): UseClientDownloaderResult {
       currentTime: 0,
     });
     
-    // Create hidden video element
-    const video = document.createElement('video');
-    video.style.position = 'fixed';
-    video.style.top = '-9999px';
-    video.style.left = '-9999px';
-    video.style.width = '1px';
-    video.style.height = '1px';
-    video.muted = true;
-    video.playsInline = true;
-    video.crossOrigin = 'anonymous';
-    document.body.appendChild(video);
-    videoRef.current = video;
+    // Create hidden iframe
+    const iframe = document.createElement('iframe');
+    iframe.style.position = 'fixed';
+    iframe.style.top = '-9999px';
+    iframe.style.left = '-9999px';
+    iframe.style.width = '640px';
+    iframe.style.height = '360px';
+    iframe.style.border = 'none';
+    iframe.style.opacity = '0';
+    iframe.style.pointerEvents = 'none';
+    iframe.allow = 'autoplay';
+    iframe.src = '/iframe-player.html';
     
-    // Determine supported MIME type for recording
-    const mimeTypes = [
-      'video/webm;codecs=vp9,opus',
-      'video/webm;codecs=vp8,opus',
-      'video/webm;codecs=vp9',
-      'video/webm;codecs=vp8',
-      'video/webm',
-      'video/mp4',
-    ];
+    document.body.appendChild(iframe);
+    iframeRef.current = iframe;
     
-    let selectedMimeType = 'video/webm';
-    for (const mimeType of mimeTypes) {
-      if (MediaRecorder.isTypeSupported(mimeType)) {
-        selectedMimeType = mimeType;
-        break;
-      }
-    }
-    
-    const startRecording = () => {
+    // Set up message handler
+    const handleMessage = (event: MessageEvent) => {
+      const data = event.data;
+      if (!data || data.source !== 'iframe-player') return;
+      
       if (cancelledRef.current) return;
       
-      // Get the media stream from video playback
-      const videoWithCapture = video as HTMLVideoElement & { 
-        captureStream?: (frameRate?: number) => MediaStream;
-        mozCaptureStream?: (frameRate?: number) => MediaStream;
-      };
+      console.log('[parent] Received from iframe:', data.type);
       
-      let stream: MediaStream | null = null;
-      
-      try {
-        if (videoWithCapture.captureStream) {
-          stream = videoWithCapture.captureStream();
-        } else if (videoWithCapture.mozCaptureStream) {
-          stream = videoWithCapture.mozCaptureStream();
-        }
-      } catch (err) {
-        console.error('Failed to capture stream:', err);
-        setProgress(prev => ({
-          ...prev,
-          phase: 'error',
-          error: 'Failed to capture video stream. This browser may not support video capture.',
-        }));
-        cleanup();
-        return;
-      }
-      
-      if (!stream) {
-        setProgress(prev => ({
-          ...prev,
-          phase: 'error',
-          error: 'Video capture is not supported in this browser.',
-        }));
-        cleanup();
-        return;
-      }
-      
-      // Create MediaRecorder
-      try {
-        const mediaRecorder = new MediaRecorder(stream, {
-          mimeType: selectedMimeType,
-          videoBitsPerSecond: 8000000,
-        });
-        mediaRecorderRef.current = mediaRecorder;
-        
-        mediaRecorder.ondataavailable = (event) => {
-          if (event.data.size > 0) {
-            recordedChunksRef.current.push(event.data);
+      switch (data.type) {
+        case 'ready':
+          // Iframe is ready, send the URL to load
+          iframe.contentWindow?.postMessage({
+            target: 'iframe-player',
+            command: 'load',
+            url: playlistUrl,
+          }, '*');
+          break;
+          
+        case 'manifest-loaded':
+          setProgress(prev => ({
+            ...prev,
+            phase: 'playing',
+            duration: data.duration || 0,
+          }));
+          break;
+          
+        case 'playback-started':
+          console.log('[parent] Playback started in iframe');
+          break;
+          
+        case 'recording-started':
+          setProgress(prev => ({
+            ...prev,
+            phase: 'recording',
+          }));
+          break;
+          
+        case 'progress':
+          if (data.duration > 0) {
+            const percentage = Math.min(Math.round((data.currentTime / data.duration) * 100), 95);
+            setProgress(prev => ({
+              ...prev,
+              percentage,
+              currentTime: data.currentTime,
+              duration: data.duration,
+            }));
           }
-        };
-        
-        mediaRecorder.onstop = () => {
-          if (cancelledRef.current) return;
+          break;
           
-          setProgress(prev => ({
-            ...prev,
-            phase: 'finalizing',
-            percentage: 95,
-          }));
+        case 'data':
+          // Receive recorded chunk from iframe
+          if (data.chunk) {
+            recordedChunksRef.current.push(new Uint8Array(data.chunk));
+            if (data.mimeType) {
+              mimeTypeRef.current = data.mimeType;
+            }
+          }
+          break;
           
-          // Create and download the file
-          const blob = new Blob(recordedChunksRef.current, { type: selectedMimeType });
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = `video.${selectedMimeType.includes('webm') ? 'webm' : 'mp4'}`;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-          URL.revokeObjectURL(url);
+        case 'ended':
+        case 'recording-stopped':
+          // Video ended or recording stopped, save the file
+          if (data.mimeType) {
+            mimeTypeRef.current = data.mimeType;
+          }
+          saveRecording();
+          break;
           
-          cleanup();
-          
-          setProgress(prev => ({
-            ...prev,
-            phase: 'complete',
-            percentage: 100,
-          }));
-        };
-        
-        mediaRecorder.onerror = () => {
-          if (cancelledRef.current) return;
+        case 'error':
+          console.error('[parent] Iframe error:', data.message);
           setProgress(prev => ({
             ...prev,
             phase: 'error',
-            error: 'Recording failed.',
+            error: data.message || 'Playback failed',
           }));
-          cleanup();
-        };
-        
-        // Start recording with 100ms chunks
-        mediaRecorder.start(100);
-        
-        setProgress(prev => ({
-          ...prev,
-          phase: 'recording',
-        }));
-        
-      } catch (err) {
-        console.error('MediaRecorder error:', err);
-        setProgress(prev => ({
-          ...prev,
-          phase: 'error',
-          error: `Recording not supported: ${err instanceof Error ? err.message : 'Unknown error'}`,
-        }));
-        cleanup();
-        return;
+          if (data.fatal) {
+            cleanup();
+          }
+          break;
+          
+        case 'stopped':
+          // Cleanup already handled
+          break;
       }
     };
     
-    // Track playback progress
-    video.ontimeupdate = () => {
-      if (cancelledRef.current) return;
-      const percentage = video.duration ? Math.round((video.currentTime / video.duration) * 100) : 0;
-      setProgress(prev => ({
-        ...prev,
-        percentage: Math.min(percentage, 95),
-        duration: video.duration || 0,
-        currentTime: video.currentTime,
-      }));
-    };
+    messageHandlerRef.current = handleMessage;
+    window.addEventListener('message', handleMessage);
     
-    // Handle video end
-    video.onended = () => {
+    // Timeout for loading
+    setTimeout(() => {
       if (cancelledRef.current) return;
-      
-      // Stop recording
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-        mediaRecorderRef.current.stop();
+      if (progress.phase === 'loading') {
+        setProgress(prev => {
+          if (prev.phase === 'loading') {
+            cleanup();
+            return {
+              ...prev,
+              phase: 'error',
+              error: 'Stream load timeout. The stream may be unavailable.',
+            };
+          }
+          return prev;
+        });
       }
-    };
+    }, 30000);
     
-    // Handle errors
-    video.onerror = () => {
-      if (cancelledRef.current) return;
-      setProgress(prev => ({
-        ...prev,
-        phase: 'error',
-        error: 'Failed to load video. The stream may be unavailable.',
-      }));
-      cleanup();
-    };
-    
-    // Load stream using hls.js
-    if (Hls.isSupported()) {
-      const hls = new Hls({
-        enableWorker: true,
-        lowLatencyMode: false,
-      });
-      hlsRef.current = hls;
-      
-      hls.loadSource(playlistUrl);
-      hls.attachMedia(video);
-      
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        if (cancelledRef.current) return;
-        
-        setProgress(prev => ({
-          ...prev,
-          phase: 'playing',
-        }));
-        
-        // Start playback
-        video.play().then(() => {
-          // Start recording after playback begins
-          // Small delay to ensure video is actually playing
-          setTimeout(() => {
-            if (!cancelledRef.current) {
-              startRecording();
-            }
-          }, 100);
-        }).catch((err) => {
-          console.error('Playback failed:', err);
-          setProgress(prev => ({
-            ...prev,
-            phase: 'error',
-            error: 'Failed to start playback. Try clicking the download button again.',
-          }));
-          cleanup();
-        });
-      });
-      
-      hls.on(Hls.Events.ERROR, (_, data) => {
-        if (cancelledRef.current) return;
-        
-        if (data.fatal) {
-          console.error('HLS fatal error:', data);
-          setProgress(prev => ({
-            ...prev,
-            phase: 'error',
-            error: 'Failed to load stream. It may be unavailable or blocked.',
-          }));
-          cleanup();
-        }
-      });
-      
-    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      // Native HLS support (Safari)
-      video.src = playlistUrl;
-      
-      video.onloadedmetadata = () => {
-        if (cancelledRef.current) return;
-        
-        setProgress(prev => ({
-          ...prev,
-          phase: 'playing',
-        }));
-        
-        video.play().then(() => {
-          setTimeout(() => {
-            if (!cancelledRef.current) {
-              startRecording();
-            }
-          }, 100);
-        }).catch((err) => {
-          console.error('Playback failed:', err);
-          setProgress(prev => ({
-            ...prev,
-            phase: 'error',
-            error: 'Failed to start playback.',
-          }));
-          cleanup();
-        });
-      };
-      
-    } else {
-      setProgress(prev => ({
-        ...prev,
-        phase: 'error',
-        error: 'HLS playback is not supported in this browser.',
-      }));
-      cleanup();
-    }
-  }, [cleanup]);
+  }, [cleanup, progress.phase, saveRecording]);
   
   return {
     progress,
