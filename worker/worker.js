@@ -116,26 +116,40 @@ function handleDownload(req, res, url) {
   const filename = generateFilename(streamUrl);
   
   // FFmpeg arguments for HLS to MP4 conversion
+  // - protocol whitelist for broad compatibility
+  // - browser-like user agent for CDN compatibility
   // - reconnect flags for unstable streams
   // - copy codecs (no re-encoding)
-  // - fragmented MP4 for streaming output
+  // - fragmented MP4 for streaming output (default_base_moof for stdout piping)
+  // - optional audio mapping for video-only streams
   const ffmpegArgs = [
-    // Input options
+    // Protocol whitelist - allows more HLS playlists to load
+    '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data',
+    
+    // Browser-like user agent for CDN compatibility
+    '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    
+    // Input options - reconnect for unstable streams
     '-reconnect', '1',
     '-reconnect_streamed', '1',
     '-reconnect_delay_max', '5',
     '-timeout', '15000000', // 15 seconds in microseconds
     '-i', streamUrl,
     
+    // Stream mapping - handle video-only streams (no audio)
+    '-map', '0:v:0',      // Map first video stream
+    '-map', '0:a?',       // Map audio if present (? = optional)
+    
     // Codec options - copy without re-encoding
     '-c:v', 'copy',
     '-c:a', 'copy',
     
-    // Audio bitstream filter for AAC in MP4
+    // Audio bitstream filter for AAC in MP4 (ignore if no audio)
     '-bsf:a', 'aac_adtstoasc',
     
     // MP4 options for streaming output
-    '-movflags', 'frag_keyframe+empty_moov+faststart',
+    // default_base_moof is required for correct stdout piping (faststart doesn't work with pipes)
+    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
     
     // Output format
     '-f', 'mp4',
@@ -146,6 +160,17 @@ function handleDownload(req, res, url) {
   
   console.log(`[${new Date().toISOString()}] Starting download: ${streamUrl}`);
   
+  // Send response headers IMMEDIATELY to prevent browser timeout
+  // Headers are sent before FFmpeg outputs any data
+  res.writeHead(200, {
+    'Content-Type': 'video/mp4',
+    'Content-Disposition': `attachment; filename="${filename}"`,
+    'Transfer-Encoding': 'chunked',
+    'Access-Control-Allow-Origin': '*',
+    'Cache-Control': 'no-cache',
+    'X-Content-Type-Options': 'nosniff',
+  });
+  
   // Spawn FFmpeg process
   const ffmpeg = spawn(FFMPEG_PATH, ffmpegArgs, {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -155,32 +180,24 @@ function handleDownload(req, res, url) {
   let hasError = false;
   let stderrBuffer = '';
   
-  // Timeout for initial data
+  // Timeout for initial data (after headers are sent)
   const startTimeout = setTimeout(() => {
     if (!hasStarted && !hasError) {
       hasError = true;
       console.error(`[${new Date().toISOString()}] Timeout waiting for FFmpeg output`);
       ffmpeg.kill('SIGKILL');
-      sendError(res, 504, 'Timeout', 'Stream took too long to start');
+      // Headers already sent, just end the response
+      if (!res.writableEnded) {
+        res.end();
+      }
     }
   }, REQUEST_TIMEOUT);
   
   // Handle FFmpeg stdout - pipe to response
   ffmpeg.stdout.on('data', (chunk) => {
-    if (!hasStarted && !hasError) {
+    if (!hasStarted) {
       hasStarted = true;
       clearTimeout(startTimeout);
-      
-      // Send response headers for streaming download
-      res.writeHead(200, {
-        'Content-Type': 'video/mp4',
-        'Content-Disposition': `attachment; filename="${filename}"`,
-        'Transfer-Encoding': 'chunked',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'no-cache',
-        'X-Content-Type-Options': 'nosniff',
-      });
-      
       console.log(`[${new Date().toISOString()}] Streaming started: ${filename}`);
     }
     
