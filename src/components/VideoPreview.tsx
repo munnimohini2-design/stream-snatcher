@@ -52,6 +52,11 @@ export function VideoPreview({ streamUrl, qualities }: VideoPreviewProps) {
 
       hls.on(Hls.Events.ERROR, (_, data) => {
         if (data.fatal) {
+          // The UI shows a generic error; log details so we can see HTTP codes/reasons.
+          // eslint-disable-next-line no-console
+          console.error('[hls.js fatal]', data);
+        }
+        if (data.fatal) {
           setError('Failed to load stream. The URL may be invalid or inaccessible.');
           setIsLoading(false);
         }

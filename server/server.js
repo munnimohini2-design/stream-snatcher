@@ -413,6 +413,16 @@ async function handleProxy(req, res, url) {
       );
     }
 
+    // Surface other upstream errors instead of masking them as 200s.
+    if (response.statusCode !== 200 && response.statusCode !== 206) {
+      return sendError(
+        res,
+        response.statusCode || 502,
+        'Upstream error',
+        `Upstream returned HTTP ${response.statusCode || 'unknown'}`
+      );
+    }
+
     // Prevent memory leak: abort upstream if client disconnects
     res.on('close', () => {
       if (upstreamReq) {
